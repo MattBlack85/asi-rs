@@ -1,9 +1,9 @@
 use crate::utils::fetch_control_caps;
 use crate::utils::get_num_of_controls;
 use libasi::camera::AsiCameraInfo;
-use lightspeed_astro::devices::actions::DeviceActions;
-use lightspeed_astro::properties::{BoolProperty, Permission, Property};
-use log::{debug, info};
+
+use astrotools::properties::{Permission, Prop, Property, RangeProperty};
+use log::{debug, error, info};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -72,66 +72,65 @@ pub mod utils {
 
     pub mod capturing {
         use crate::CcdDevice;
+        use astrotools::properties::Prop;
         use libasi::camera::{
             download_exposure, exposure_status, set_control_value, start_exposure,
         };
         use log::{debug, error, info};
-        use rfitsio::fill_to_2880;
+        use rumqttc::Event::Incoming;
+        use rumqttc::{Client, MqttOptions};
         use std::sync::{Arc, RwLock};
+        use std::time::Duration;
         use std::time::SystemTime;
 
-        pub fn expose(
-            camera_index: i32,
-            length: f32,
-            width: i32,
-            height: i32,
-            img_type: i32,
-            device: Arc<RwLock<CcdDevice>>,
-        ) {
-            info!("Actual width requested: {}", width);
-            info!("Actual height requested: {}", height);
+        pub fn expose(length: f32, img_type: i32, device: Arc<RwLock<CcdDevice>>) {
+            let r_dev = device.read().unwrap();
+            let width = r_dev.width.value().clone();
+            let height = r_dev.height.value().clone();
+            let idx = r_dev.idx;
 
-            // Create the right sized buffer for the image to be stored.
-            // if we shoot at 8 bit it is just width * height
-            let mut buffer_size: i32 = width * height;
+            drop(r_dev);
+
+            // // Create the right sized buffer for the image to be stored.
+            // // if we shoot at 8 bit it is just width * height
+            let buffer_size: i32;
 
             buffer_size = match img_type {
-                1 | 2 => buffer_size * 2,
-                _ => buffer_size,
+                libasi::camera::ASI_IMG_TYPE_ASI_IMG_RGB24 => width * height * 3,
+                libasi::camera::ASI_IMG_TYPE_ASI_IMG_RAW16 => width * height * 2,
+                libasi::camera::ASI_IMG_TYPE_ASI_IMG_RAW8
+                | libasi::camera::ASI_IMG_TYPE_ASI_IMG_Y8 => width * height,
+                _ => todo!(),
             };
 
-            let secs_to_micros = length * num::pow(10i32, 6) as f32;
-            info!("mu secs {}", secs_to_micros);
+            let secs_to_micros: i64 = (length * 1_000_000_f32) as i64;
 
             let mut image_buffer = Vec::with_capacity(buffer_size as usize);
+
+            // Since the Vec will serve as buffer for FFI, we call set_lenght
+            // see here https://doc.rust-lang.org/std/vec/struct.Vec.html#examples-22
             unsafe {
                 image_buffer.set_len(buffer_size as usize);
             }
-            let mut status = 5;
+            let mut status = 0;
 
-            // Swapping exposure related properties AKA prepare props to show
-            // informations about ongoing exposure
-            {
-                let mut d = device.write().unwrap();
-                d.exposure_status
-                    .set_val(std::borrow::Cow::Borrowed("EXPOSING"));
-            }
+            debug!("Update prop exposing {}", secs_to_micros);
 
             // Set the value of the exposure on the driver
             #[cfg(unix)]
             {
                 set_control_value(
-                    camera_index,
+                    idx,
                     libasi::camera::ASI_CONTROL_TYPE_ASI_EXPOSURE as i32,
-                    secs_to_micros as i64,
-                    0,
+                    secs_to_micros,
+                    libasi::camera::ASI_BOOL_ASI_FALSE as i32,
                 );
             }
 
             #[cfg(windows)]
             {
                 set_control_value(
-                    camera_index,
+                    idx,
                     libasi::camera::ASI_CONTROL_TYPE_ASI_EXPOSURE as i32,
                     secs_to_micros as i32,
                     0,
@@ -139,136 +138,71 @@ pub mod utils {
             }
 
             // Send the command to start the exposure
-            start_exposure(camera_index);
-
-            // Check the status, when exposing it should be 1
-            exposure_status(camera_index, &mut status);
-
+            start_exposure(idx);
+            exposure_status(idx, &mut status);
             let start = SystemTime::now();
+            // Swapping exposure related properties AKA prepare props to show
+            // informations about ongoing exposure
+            {
+                let mut d = device.write().unwrap();
+                d.exposure_status
+                    .update_int(std::borrow::Cow::Borrowed("EXPOSING"));
+            }
+
+            debug!("Started exposure");
 
             // Loop until the status change
             while status == 1 {
-                exposure_status(camera_index, &mut status);
+                exposure_status(idx, &mut status);
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
             info!("Elapsed: {}", start.elapsed().unwrap().as_micros());
 
             match status {
-                2 => info!("Exposure successful"),
-                n => error!("An error happened, the exposure status is {}", n),
-            }
-
-            info!("Status after exposure: {}", status);
-
-            match status {
-                2 => {
+                libasi::camera::ASI_EXPOSURE_STATUS_ASI_EXP_SUCCESS => {
+                    info!("Exposure successful");
                     {
                         let mut d = device.write().unwrap();
                         d.exposure_status
-                            .set_val(std::borrow::Cow::Borrowed("SUCCESS"));
+                            .update_int(std::borrow::Cow::Borrowed("SUCCESS"));
                     }
 
-                    download_exposure(camera_index, image_buffer.as_mut_ptr(), buffer_size.into());
+                    info!("downloading");
+                    download_exposure(idx, image_buffer.as_mut_ptr(), buffer_size.into());
+
+                    let mut mqttoptions = MqttOptions::new("asi_exposure", "127.0.0.1", 1883);
+                    mqttoptions.set_keep_alive(Duration::from_secs(5));
+                    let (mut client, mut connection) = Client::new(mqttoptions, 10);
+
+                    client
+                        .publish(
+                            format!(
+                                "{}",
+                                format_args!(
+                                    "devices/{}/exposure",
+                                    &device.read().unwrap().id.to_string()
+                                )
+                            ),
+                            rumqttc::QoS::AtLeastOnce,
+                            false,
+                            image_buffer,
+                        )
+                        .unwrap();
+
+                    for notification in connection.iter() {
+                        match notification {
+                            Ok(Incoming(inc)) => match inc {
+                                rumqttc::Packet::PubAck(_m) => break,
+                                _ => continue,
+                            },
+                            _ => continue,
+                        }
+                    }
                 }
-                _ => error!("Exposure failed"),
+                libasi::camera::ASI_EXPOSURE_STATUS_ASI_EXP_FAILED => error!("Exposure failed"),
+                n => error!("A error happened: {}", n),
             }
-
-            let mut final_image: Vec<u8> = Vec::new();
-            for b in
-                b"SIMPLE  =                    T / file conforms to FITS standard                 "
-                    .into_iter()
-            {
-                final_image.push(*b);
-            }
-
-            let bitpix = match img_type {
-		1 | 2 => format!(
-                    "BITPIX  =                   {} / number of bits per data pixel                  ",
-                    "16"
-		),
-		_ => format!(
-                    "BITPIX  =                   {} / number of bits per data pixel                  ",
-                    " 8"
-		),
-            };
-
-            let naxis1;
-            if width < 1000 {
-                naxis1 = format!(
-                    "NAXIS1  =                 {}{} / length of data axis 1                          ",
-                    " ", width
-		);
-            } else {
-                naxis1 = format!(
-                    "NAXIS1  =                 {} / length of data axis 1                          ",
-                    width
-		);
-            }
-
-            let naxis2;
-            if height < 1000 {
-                naxis2 = format!(
-                    "NAXIS2  =                 {}{} / length of data axis 2                          ",
-                    " ", height
-		);
-            } else {
-                naxis2 = format!(
-                    "NAXIS2  =                 {} / length of data axis 2                          ",
-                    height
-		);
-            }
-
-            debug!("Len of NAXIS1 {}", naxis1.len());
-            debug!("Len of NAXIS2 {}", naxis2.len());
-
-            for b in bitpix.as_bytes().into_iter() {
-                final_image.push(*b);
-            }
-            for b in
-                b"NAXIS   =                    2 / number of axis                                 "
-                    .into_iter()
-            {
-                final_image.push(*b);
-            }
-            for b in naxis1.as_bytes().into_iter() {
-                final_image.push(*b);
-            }
-            for b in naxis2.as_bytes().into_iter() {
-                final_image.push(*b);
-            }
-
-            for b in b"END".into_iter() {
-                final_image.push(*b);
-            }
-
-            debug!("File len after headers: {}", final_image.len());
-
-            for _ in 0..fill_to_2880(final_image.len() as i32) {
-                final_image.push(32);
-            }
-
-            debug!("File len after filling: {}", final_image.len());
-
-            for b in &image_buffer {
-                final_image.push(*b);
-            }
-
-            debug!("File len after image: {}", final_image.len());
-
-            for _ in 0..fill_to_2880(final_image.len() as i32) {
-                final_image.push(32);
-            }
-
-            debug!("File len after filling image: {}", final_image.len());
-
-            match std::fs::write(
-                format!("zwo-{}-001.fits", &device.read().unwrap().name),
-                &final_image,
-            ) {
-                Ok(_) => debug!("FITS file saved correctly"),
-                Err(e) => error!("FITS file not saved on disk: {}", e),
-            };
         }
     }
 
@@ -482,53 +416,6 @@ pub mod utils {
     }
 }
 
-// pub trait BaseAstroDevice {
-//     /// Main and only entrypoint to create a new serial device.
-//     ///
-//     /// A device that doesn't work/cannot communicate with is not really useful
-//     /// so this may return `None` if there is something wrong with the just
-//     /// discovered device.
-//     fn new(index: i32) -> Self
-//     where
-//         Self: Sized;
-
-//     /// Use this method to fetch the real properties from the device,
-//     /// this should not be called directly from clients ideally,
-//     /// for that goal `get_properties` should be used.
-//     fn fetch_props(&mut self);
-
-//     /// Use this method to return the id of the device as a uuid.
-//     fn get_id(&self) -> Uuid;
-
-//     /// Use this method to return the name of the device (e.g. ZWO533MC).
-//     fn get_name(&self) -> &String;
-
-//     /// Use this method to return the actual cached state stored into `self.properties`.
-//     //fn get_properties(&self) -> &Vec<Property>;
-
-//     /// Method to be used when receving requests from clients to update properties.
-//     ///
-//     /// Ideally this should call internally `update_property_remote` which will be
-//     /// responsible to trigger the action against the device to update the property
-//     /// on the device itself, if the action is successful the last thing this method
-//     /// does would be to update the property inside `self.properties`.
-//     fn update_property(&mut self, prop_name: &str, val: &str) -> Result<(), DeviceActions>;
-
-//     /// Method used internally by the driver itself to change values for properties that
-//     /// be manipulated by the user (like the exposure ones)
-//     fn update_internal_property(&mut self, prop_name: &str, val: &str)
-//         -> Result<(), DeviceActions>;
-
-//     /// Use this method to send a command to the device to change the requested property.
-//     ///
-//     /// Ideally this method will be a big `match` clause where the matching will execute
-//     /// `self.send_command` to issue a serial command to the device.
-//     fn update_property_remote(&mut self, prop_name: &str, val: &str) -> Result<(), DeviceActions>;
-
-//     /// Properties are packed into a vector so to find them we need to
-//     /// lookup the index, use this method to do so.
-//     fn find_property_index(&self, prop_name: &str) -> Option<usize>;
-// }
 #[derive(Debug)]
 pub struct AsiProperty {
     name: String,
@@ -550,10 +437,10 @@ pub struct CcdDevice {
     #[serde(skip)]
     caps: Vec<AsiProperty>,
     #[serde(flatten)]
-    controls: std::collections::HashMap<String, Property<isize>>,
+    controls: std::collections::HashMap<String, RangeProperty<isize>>,
     #[serde(skip)]
     _ls_rand_id: [u8; 8],
-    is_color: BoolProperty,
+    is_color: Property<bool>,
     camera_id: Property<u8>,
     max_height: Property<u16>,
     max_width: Property<u16>,
@@ -561,13 +448,13 @@ pub struct CcdDevice {
     bins: Property<Cow<'static, str>>,
     video_formats: Property<Cow<'static, str>>,
     pix_size: Property<f64>,
-    has_shutter: BoolProperty,
-    st4: BoolProperty,
+    has_shutter: Property<bool>,
+    st4: Property<bool>,
     e_adu: Property<f32>,
     bit_depth: Property<u8>,
     lightspeed_id: Property<Cow<'static, str>>,
     // Properties to build logic around exposures
-    exposing: BoolProperty,
+    exposing: Property<bool>,
     exposure_status: Property<Cow<'static, str>>,
     width: Property<i32>,
     height: Property<i32>,
@@ -620,46 +507,41 @@ impl CcdDevice {
             caps,
             controls: HashMap::new(),
             _ls_rand_id: [0; 8],
-            is_color: BoolProperty::new(info.IsColorCam == 1, Permission::ReadOnly),
-            camera_id: Property::<u8>::new(info.CameraID as u8, Permission::ReadOnly, None),
-            max_height: Property::<u16>::new(info.MaxHeight as u16, Permission::ReadOnly, None),
-            max_width: Property::<u16>::new(info.MaxWidth as u16, Permission::ReadOnly, None),
+            is_color: Property::new(info.IsColorCam == 1, Permission::ReadOnly),
+            camera_id: Property::<u8>::new(info.CameraID as u8, Permission::ReadOnly),
+            max_height: Property::<u16>::new(info.MaxHeight as u16, Permission::ReadOnly),
+            max_width: Property::<u16>::new(info.MaxWidth as u16, Permission::ReadOnly),
             bayer_pattern: Property::<Cow<'static, str>>::new(
                 Cow::Borrowed(&utils::bayer_pattern_to_str(&info.BayerPattern)),
                 Permission::ReadOnly,
-                None,
             ),
             bins: Property::<Cow<'static, str>>::new(
                 Cow::Owned(utils::int_to_binning_str(&info.SupportedBins)),
                 Permission::ReadOnly,
-                None,
             ),
             video_formats: Property::<Cow<'static, str>>::new(
                 Cow::Owned(utils::int_to_image_type_array(&info.SupportedVideoFormat)),
                 Permission::ReadOnly,
-                None,
             ),
-            pix_size: Property::<f64>::new(info.PixelSize, Permission::ReadOnly, None),
-            has_shutter: BoolProperty::new(info.MechanicalShutter == 1_u32, Permission::ReadOnly),
-            st4: BoolProperty::new(info.ST4Port == 1_u32, Permission::ReadOnly),
-            e_adu: Property::<f32>::new(info.ElecPerADU, Permission::ReadOnly, None),
-            bit_depth: Property::<u8>::new(info.BitDepth as u8, Permission::ReadOnly, None),
+            pix_size: Property::<f64>::new(info.PixelSize, Permission::ReadOnly),
+            has_shutter: Property::new(info.MechanicalShutter == 1_u32, Permission::ReadOnly),
+            st4: Property::new(info.ST4Port == 1_u32, Permission::ReadOnly),
+            e_adu: Property::<f32>::new(info.ElecPerADU, Permission::ReadOnly),
+            bit_depth: Property::<u8>::new(info.BitDepth as u8, Permission::ReadOnly),
             lightspeed_id: Property::<Cow<'static, str>>::new(
                 Cow::Borrowed("lol"),
                 Permission::ReadOnly,
-                None,
             ),
             // Properties to build logic around exposures
-            exposing: BoolProperty::new(false, Permission::ReadWrite),
+            exposing: Property::new(false, Permission::ReadWrite),
             exposure_status: Property::<Cow<'static, str>>::new(
                 Cow::Borrowed("IDLE"),
                 Permission::ReadWrite,
-                None,
             ),
-            width: Property::new(0, Permission::ReadWrite, None),
-            height: Property::new(0, Permission::ReadWrite, None),
-            bin: Property::new(0, Permission::ReadWrite, None),
-            image_type: Property::new(0, Permission::ReadWrite, None),
+            width: Property::new(0, Permission::ReadWrite),
+            height: Property::new(0, Permission::ReadWrite),
+            bin: Property::new(0, Permission::ReadWrite),
+            image_type: Property::new(0, Permission::ReadWrite),
         };
 
         device.asi_caps_to_lightspeed_props();
@@ -676,7 +558,7 @@ impl CcdDevice {
             debug!("Cap {} value is  {}", &cap.name, &val);
             let v = self.controls.get_mut(&cap.name).unwrap();
             if v.value() != &val {
-                v.set_val(val);
+                v.update_int(val);
             }
         }
 
@@ -690,8 +572,16 @@ impl CcdDevice {
     /// responsible to trigger the action against the device to update the property
     /// on the device itself, if the action is successful the last thing this method
     /// does would be to update the property inside `self.properties`.
-    fn update_property(&mut self, _prop_name: &str, _val: &str) -> Result<(), DeviceActions> {
-        todo!();
+    pub fn update_property(&mut self, prop_name: &str, val: i32) {
+        info!("UPDATE: prop name {}", &prop_name);
+        info!("UPDATE: val {}", &val);
+        match prop_name {
+            "img_type" => {
+                self.set_roi_format(None, None, None, Some(val));
+                self.fetch_roi_format();
+            }
+            _ => error!("Unknown property: {}", prop_name),
+        }
     }
 
     fn index(&self) -> &i32 {
@@ -703,17 +593,15 @@ impl CcdDevice {
             debug!("CAP name: {}", &cap.name);
             let cap_value = self.get_control_value(cap);
             // here we create lightspeed properties from AsiCaps
-            let prop = Property::<isize>::new(
+            let prop = RangeProperty::<isize>::new(
                 cap_value,
                 if cap.is_writable {
                     Permission::ReadWrite
                 } else {
                     Permission::ReadOnly
                 },
-                Some((
-                    cap._min_value.try_into().unwrap(),
-                    cap._max_value.try_into().unwrap(),
-                )),
+                cap._min_value.try_into().unwrap(),
+                cap._max_value.try_into().unwrap(),
             );
             self.controls.insert(cap.name.to_owned(), prop);
         }
@@ -745,10 +633,10 @@ impl CcdDevice {
 
     fn fetch_roi_format(&mut self) {
         info!("Reading ROI");
-        let mut width = 0;
-        let mut height = 0;
-        let mut bin = 0;
-        let mut img_type = 0;
+        let mut width = 10;
+        let mut height = 10;
+        let mut bin = 10;
+        let mut img_type = 10;
 
         libasi::camera::get_roi_format(
             *self.index(),
@@ -771,5 +659,37 @@ impl CcdDevice {
             self.bin.value(),
             self.image_type.value()
         );
+    }
+
+    fn set_roi_format(
+        &self,
+        width: Option<i32>,
+        height: Option<i32>,
+        bin: Option<i32>,
+        img_type: Option<i32>,
+    ) {
+        info!("Setting ROI");
+        let w = if let Some(w) = width {
+            w
+        } else {
+            *self.width.value()
+        };
+        let h = if let Some(h) = height {
+            h
+        } else {
+            *self.height.value()
+        };
+        let b = if let Some(b) = bin {
+            b
+        } else {
+            *self.bin.value()
+        };
+        let img = if let Some(img) = img_type {
+            img
+        } else {
+            *self.image_type.value()
+        };
+
+        libasi::camera::set_roi_format(*self.index(), w, h, b, img);
     }
 }

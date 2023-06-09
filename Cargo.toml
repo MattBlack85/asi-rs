@@ -25,7 +25,7 @@ env_logger = "0.9"
 log = "0.4"
 rfitsio = { git = "https://github.com/devducks/rfitsio", tag = "v0.2.0" }
 num = "0.4"
-astrotools = "0.4"
+astrotools = { git = "https://github.com/devducks/astrotools", branch = "chore/lib" }
 lightspeed-astro = "1.1"
 tonic = "0.9"
 tonic-reflection = "0.9"
