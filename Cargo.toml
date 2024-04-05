@@ -8,10 +8,6 @@ name = "asi_ccd"
 path = "src/bin/ccd/main.rs"
 
 [[bin]]
-name = "asi_ccd_mqtt"
-path = "src/bin/ccd/mqtt.rs"
-
-[[bin]]
 name = "test_camera"
 path = "src/bin/test/main.rs"
 
@@ -37,6 +33,7 @@ serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
 rumqttc = "0.21.0"
 console-subscriber = "0.1.9"
+base64 = "0.22.0"
 
 [dependencies.uuid]
 version = "1"
